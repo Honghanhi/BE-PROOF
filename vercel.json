@@ -1,0 +1,25 @@
+{
+  "version": 2,
+  "builds": [
+    { "src": "index.html",    "use": "@vercel/static" },
+    { "src": "analyze.html",  "use": "@vercel/static" },
+    { "src": "result.html",   "use": "@vercel/static" },
+    { "src": "timeline.html", "use": "@vercel/static" },
+    { "src": "lab.html",      "use": "@vercel/static" },
+    { "src": "assets/**",     "use": "@vercel/static" }
+  ],
+  "routes": [
+    { "src": "/api/(.*)", "dest": "https://your-api-host.com/$1" },
+    { "src": "/(.*)",     "dest": "/$1" }
+  ],
+  "headers": [
+    {
+      "source": "/(.*)",
+      "headers": [
+        { "key": "X-Content-Type-Options", "value": "nosniff" },
+        { "key": "X-Frame-Options",        "value": "DENY" },
+        { "key": "X-XSS-Protection",       "value": "1; mode=block" }
+      ]
+    }
+  ]
+}
