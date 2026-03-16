@@ -45,12 +45,17 @@ _pipeline_error: str | None = None
 
 def _load_pipeline():
     """
-    Load model qua ONNX Runtime (optimum).
-    - export=True  : tự convert HuggingFace → ONNX lần đầu chạy
-    - Không cần torch, không cần GPU
-    - RAM ~200–280MB thay vì ~500MB
+    Load model qua ONNX Runtime thuần — KHÔNG dùng torch.
+    - Dùng ORTModelForSequenceClassification từ optimum
+    - Dùng InferenceSession trực tiếp nếu optimum cũng kéo torch
+    - RAM ~200–280MB, chạy tốt trên CPU Render free tier
     """
     global _pipeline, _pipeline_error
+
+    # Chặn torch được import bởi bất kỳ sub-dependency nào
+    import sys
+    sys.modules.setdefault("torch", None)  # type: ignore
+
     try:
         from optimum.onnxruntime import ORTModelForSequenceClassification
         from transformers import AutoTokenizer, pipeline as hf_pipeline
@@ -62,8 +67,8 @@ def _load_pipeline():
 
         model = ORTModelForSequenceClassification.from_pretrained(
             MODEL_ID,
-            export=True,          # convert sang ONNX nếu chưa có file .onnx
-            provider="CPUExecutionProvider",  # bắt buộc dùng CPU trên Render
+            export=True,                        # convert HF → ONNX lần đầu
+            provider="CPUExecutionProvider",    # CPU only, không cần GPU
         )
 
         _pipeline = hf_pipeline(
