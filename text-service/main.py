@@ -1,105 +1,175 @@
 """
 AI Text Detection Service
 ══════════════════════════════════════════════════════════════
-Primary model : Hello-SimpleAI/chatgpt-detector-roberta  (ONNX Runtime)
-Fallback      : statistical heuristic (zero dependencies)
+Runtime       : ONNX Runtime thuần CPU  (KHÔNG có torch)
+Primary model : Hello-SimpleAI/chatgpt-detector-roberta
+Fallback      : statistical heuristic
 
-Thay đổi so với bản gốc
-────────────────────────
-- Dùng optimum[onnxruntime] thay cho torch+transformers thuần
-- RAM giảm từ ~500MB xuống ~200–280MB → chạy được trên Render free tier
-- Tự động export sang ONNX lần đầu chạy (export=True)
-- Mọi logic chunking, label parsing, heuristic fallback giữ nguyên
+Dependencies (nhẹ, không kéo torch):
+  onnxruntime      ~10 MB
+  tokenizers       ~4  MB  (pure Rust)
+  huggingface-hub  ~1  MB
+  numpy            ~20 MB
+  fastapi + uvicorn
 
 Label mapping
 ─────────────
-  LABEL_0  →  FAKE  →  AI-generated   (low trust score)
-  LABEL_1  →  REAL  →  Human-written  (high trust score)
+  LABEL_0 / Fake → AI-generated   (low trust)
+  LABEL_1 / Real → Human-written  (high trust)
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 import time
 from typing import Any
 
+import numpy as np
+
 log = logging.getLogger("aiproof.ai_text")
 
 # ── Model config ──────────────────────────────────────────────────────────────
 
-MODEL_ID      = "Hello-SimpleAI/chatgpt-detector-roberta"
-MODEL_NAME    = "ChatGPT Detector RoBERTa (Hello-SimpleAI)"
-MODEL_WEIGHT  = 0.35
+MODEL_ID       = "Hello-SimpleAI/chatgpt-detector-roberta"
+MODEL_NAME     = "ChatGPT Detector RoBERTa (Hello-SimpleAI)"
+MODEL_WEIGHT   = 0.35
 
-MAX_TOKENS    = 512
-WINDOW_TOKENS = 480
+MAX_TOKENS     = 512
+WINDOW_TOKENS  = 480
 OVERLAP_TOKENS = 32
 
-# ── Pipeline singleton ────────────────────────────────────────────────────────
+# ── Globals ───────────────────────────────────────────────────────────────────
 
-_pipeline = None
+_pipeline      = None        # True khi ORT session sẵn sàng
 _pipeline_error: str | None = None
+
+_ORT_SESSION   = None        # onnxruntime.InferenceSession
+_TOKENIZER     = None        # tokenizers.Tokenizer
+_ID2LABEL: dict[int, str] = {}
+
+_ONNX_CANDIDATES = ["model.onnx", "onnx/model.onnx", "pytorch_model.onnx"]
+
+
+# ── Load pipeline ─────────────────────────────────────────────────────────────
+
+def _softmax(logits: np.ndarray) -> np.ndarray:
+    e = np.exp(logits - logits.max(axis=-1, keepdims=True))
+    return e / e.sum(axis=-1, keepdims=True)
 
 
 def _load_pipeline():
     """
-    Load model qua ONNX Runtime thuần — KHÔNG dùng torch.
-    - Dùng ORTModelForSequenceClassification từ optimum
-    - Dùng InferenceSession trực tiếp nếu optimum cũng kéo torch
-    - RAM ~200–280MB, chạy tốt trên CPU Render free tier
+    Load model dùng ONNX Runtime + tokenizers (Rust).
+    Hoàn toàn KHÔNG import torch / transformers / optimum ở runtime.
+    RAM ~200–280 MB thay vì ~500 MB.
     """
-    global _pipeline, _pipeline_error
-
-    # Chặn torch được import bởi bất kỳ sub-dependency nào
-    import sys
-    sys.modules.setdefault("torch", None)  # type: ignore
+    global _pipeline, _pipeline_error, _ORT_SESSION, _TOKENIZER, _ID2LABEL
 
     try:
-        from optimum.onnxruntime import ORTModelForSequenceClassification
-        from transformers import AutoTokenizer, pipeline as hf_pipeline
+        import onnxruntime as ort
+        from tokenizers import Tokenizer
+        from huggingface_hub import hf_hub_download
 
-        log.info("Loading %s via ONNX Runtime…", MODEL_ID)
+        log.info("Downloading tokenizer + ONNX model from %s …", MODEL_ID)
         t0 = time.time()
 
-        tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+        # 1. Tokenizer (pure Rust, không cần torch)
+        tok_path   = hf_hub_download(MODEL_ID, "tokenizer.json")
+        _TOKENIZER = Tokenizer.from_file(tok_path)
+        _TOKENIZER.enable_truncation(max_length=MAX_TOKENS)
+        _TOKENIZER.enable_padding()
 
-        model = ORTModelForSequenceClassification.from_pretrained(
-            MODEL_ID,
-            export=True,                        # convert HF → ONNX lần đầu
-            provider="CPUExecutionProvider",    # CPU only, không cần GPU
+        # 2. id2label từ config.json
+        cfg_path = hf_hub_download(MODEL_ID, "config.json")
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+        _ID2LABEL = {
+            int(k): v
+            for k, v in cfg.get("id2label", {"0": "LABEL_0", "1": "LABEL_1"}).items()
+        }
+
+        # 3. Tìm file .onnx
+        onnx_path = None
+        for candidate in _ONNX_CANDIDATES:
+            try:
+                onnx_path = hf_hub_download(MODEL_ID, candidate)
+                log.info("Found ONNX: %s", candidate)
+                break
+            except Exception:
+                continue
+
+        # 4. Nếu không có .onnx → convert bằng optimum-cli (subprocess, không import torch)
+        if onnx_path is None:
+            log.info("No .onnx in repo — exporting with optimum-cli …")
+            import subprocess, tempfile
+            from pathlib import Path
+            out_dir = tempfile.mkdtemp(prefix="onnx_export_")
+            proc = subprocess.run(
+                [
+                    "optimum-cli", "export", "onnx",
+                    "--model", MODEL_ID,
+                    "--task",  "text-classification",
+                    out_dir,
+                ],
+                capture_output=True, text=True, timeout=300,
+            )
+            if proc.returncode != 0:
+                raise RuntimeError(f"optimum-cli export failed:\n{proc.stderr}")
+            onnx_path = str(Path(out_dir) / "model.onnx")
+            log.info("ONNX export → %s", onnx_path)
+
+        # 5. Tạo InferenceSession
+        opts = ort.SessionOptions()
+        opts.intra_op_num_threads = 2    # giới hạn CPU cho Render free tier
+        _ORT_SESSION = ort.InferenceSession(
+            onnx_path,
+            sess_options=opts,
+            providers=["CPUExecutionProvider"],
         )
 
-        _pipeline = hf_pipeline(
-            "text-classification",
-            model=model,
-            tokenizer=tokenizer,
-            top_k=None,
-            truncation=True,
-            max_length=MAX_TOKENS,
-        )
-
-        log.info("%s loaded via ONNX in %.1fs", MODEL_ID, time.time() - t0)
+        _pipeline = True   # flag "đã sẵn sàng"
+        log.info("%s loaded via pure ONNX in %.1fs", MODEL_ID, time.time() - t0)
 
     except Exception as exc:
         _pipeline_error = str(exc)
-        log.warning(
-            "Could not load %s (%s) — heuristic fallback active",
-            MODEL_ID, exc,
-        )
+        log.warning("Load failed (%s) — heuristic fallback active", exc)
 
 
 _load_pipeline()
 
 
+# ── ONNX predict ──────────────────────────────────────────────────────────────
+
+def _ort_predict(texts: list[str]) -> list[list[dict]]:
+    """Batch inference qua ORT. Trả về list[list[{label, score}]]."""
+    enc            = _TOKENIZER.encode_batch(texts)
+    input_ids      = np.array([e.ids for e in enc],            dtype=np.int64)
+    attention_mask = np.array([e.attention_mask for e in enc], dtype=np.int64)
+
+    feeds: dict[str, np.ndarray] = {
+        "input_ids":      input_ids,
+        "attention_mask": attention_mask,
+    }
+    input_names = [inp.name for inp in _ORT_SESSION.get_inputs()]
+    if "token_type_ids" in input_names:
+        feeds["token_type_ids"] = np.zeros_like(input_ids)
+
+    logits = _ORT_SESSION.run(None, feeds)[0]   # (batch, num_labels)
+    probs  = _softmax(logits)
+
+    return [
+        [{"label": _ID2LABEL.get(i, f"LABEL_{i}"), "score": float(row[i])}
+         for i in range(len(row))]
+        for row in probs
+    ]
+
+
 # ── Label normalisation ───────────────────────────────────────────────────────
 
 def _parse_labels(raw: list[dict]) -> tuple[float, float]:
-    """
-    Map raw pipeline output → (ai_pct, human_pct).
-    Xử lý tất cả label format: LABEL_0/1, Fake/Real, AI/Human, generated/original
-    """
     mapping: dict[str, float] = {}
     for item in raw:
         lbl = item["label"].upper()
@@ -115,56 +185,39 @@ def _parse_labels(raw: list[dict]) -> tuple[float, float]:
     elif not mapping:
         mapping = {"ai": 0.5, "human": 0.5}
 
-    ai_pct    = round(mapping["ai"]    * 100, 2)
-    human_pct = round(mapping["human"] * 100, 2)
-    return ai_pct, human_pct
+    return round(mapping["ai"] * 100, 2), round(mapping["human"] * 100, 2)
 
 
 # ── Chunked inference ─────────────────────────────────────────────────────────
 
-def _chunk_text(text: str, tokenizer) -> list[str]:
-    """Chia text thành các cửa sổ token chồng lấp để xử lý văn bản dài."""
-    ids    = tokenizer.encode(text, add_special_tokens=False)
-    stride = WINDOW_TOKENS - OVERLAP_TOKENS
-    chunks = []
-    start  = 0
-    while start < len(ids):
-        window = ids[start : start + WINDOW_TOKENS]
-        chunks.append(tokenizer.decode(window, skip_special_tokens=True))
-        start += stride
-        if start + WINDOW_TOKENS >= len(ids):
-            tail = ids[start:]
-            if tail:
-                chunks.append(tokenizer.decode(tail, skip_special_tokens=True))
-            break
-    return chunks or [text]
-
-
 def _run_inference(text: str) -> tuple[float, float, float]:
     """
-    Blocking inference — được gọi qua asyncio.to_thread().
+    Blocking inference qua ONNX Runtime (không có torch).
     Trả về (ai_pct, human_pct, confidence).
     """
-    pipe      = _pipeline
-    tokenizer = pipe.tokenizer
-
     approx_tokens = len(text.split()) * 1.3
 
     if approx_tokens <= WINDOW_TOKENS:
-        raw        = pipe(text, truncation=True, max_length=MAX_TOKENS)[0]
-        chunks_raw = [raw if isinstance(raw, list) else [raw]]
         chunk_texts = [text]
     else:
-        chunk_texts = _chunk_text(text, tokenizer)
-        chunks_raw  = [
-            (r if isinstance(r, list) else [r])
-            for r in pipe(chunk_texts, truncation=True, max_length=MAX_TOKENS)
-        ]
+        ids    = _TOKENIZER.encode(text).ids
+        stride = WINDOW_TOKENS - OVERLAP_TOKENS
+        chunks = []
+        start  = 0
+        while start < len(ids):
+            window = ids[start : start + WINDOW_TOKENS]
+            chunks.append(_TOKENIZER.decode(window))
+            start += stride
+            if start + WINDOW_TOKENS >= len(ids):
+                tail = ids[start:]
+                if tail:
+                    chunks.append(_TOKENIZER.decode(tail))
+                break
+        chunk_texts = chunks or [text]
 
-    total_weight = 0.0
-    ai_sum       = 0.0
-    human_sum    = 0.0
-    conf_sum     = 0.0
+    chunks_raw = _ort_predict(chunk_texts)
+
+    total_weight = ai_sum = human_sum = conf_sum = 0.0
 
     for i, label_list in enumerate(chunks_raw):
         w          = len(chunk_texts[i].split()) if i < len(chunk_texts) else 1
@@ -178,20 +231,17 @@ def _run_inference(text: str) -> tuple[float, float, float]:
     if total_weight == 0:
         return 50.0, 50.0, 0.5
 
-    ai_pct     = round(ai_sum    / total_weight, 2)
-    human_pct  = round(human_sum / total_weight, 2)
-    confidence = round(conf_sum  / total_weight, 4)
-
-    return ai_pct, human_pct, confidence
+    return (
+        round(ai_sum    / total_weight, 2),
+        round(human_sum / total_weight, 2),
+        round(conf_sum  / total_weight, 4),
+    )
 
 
 # ── Heuristic fallback ────────────────────────────────────────────────────────
 
 def _heuristic_fallback(text: str) -> tuple[float, float, float]:
-    """
-    Fallback thuần Python khi ONNX pipeline không load được.
-    Confidence luôn thấp (≤ 0.55) để báo hiệu chế độ fallback.
-    """
+    """Fallback thuần Python khi ONNX không load được. Confidence ≤ 0.55."""
     import re as _re
 
     words = text.split()
@@ -216,19 +266,12 @@ def _heuristic_fallback(text: str) -> tuple[float, float, float]:
         "as mentioned earlier", "delve", "underscore", "pivotal",
         "it should be noted", "with that said", "that being said",
     ]
-    text_lower  = text.lower()
-    marker_hits = sum(1 for m in AI_MARKERS if m in text_lower)
+    marker_hits = sum(1 for m in AI_MARKERS if m in text.lower())
 
-    ttr_signal    = max(0, (0.72 - ttr) * 60)
-    var_signal    = max(0, (8.0 - std_dev) * 2.5)
-    marker_signal = min(30, marker_hits * 7)
-
-    ai_raw    = ttr_signal + var_signal + marker_signal
+    ai_raw    = max(0, (0.72 - ttr) * 60) + max(0, (8.0 - std_dev) * 2.5) + min(30, marker_hits * 7)
     ai_pct    = round(min(92, max(8, ai_raw)), 2)
     human_pct = round(100 - ai_pct, 2)
-
-    wc_conf    = min(1.0, len(words) / 250)
-    confidence = round(0.35 + wc_conf * 0.20, 4)
+    confidence = round(0.35 + min(1.0, len(words) / 250) * 0.20, 4)
 
     return ai_pct, human_pct, confidence
 
@@ -236,90 +279,58 @@ def _heuristic_fallback(text: str) -> tuple[float, float, float]:
 # ── Public entry point ────────────────────────────────────────────────────────
 
 async def analyze_text(text: str) -> dict[str, Any]:
-    """
-    Phân tích text để phát hiện AI-generated content.
-
-    Trả về:
-        {
-          "models": [
-            {
-              "modelId":       str,
-              "modelName":     str,
-              "ai_percent":    float,   # 0–100
-              "human_percent": float,   # 0–100
-              "confidence":    float,   # 0–1
-              "score":         float,   # = human_percent
-              "latencyMs":     int,
-            }
-          ]
-        }
-    """
     t0 = time.time()
 
     if _pipeline is not None:
         try:
-            ai_pct, human_pct, confidence = await asyncio.to_thread(
-                _run_inference, text
-            )
+            ai_pct, human_pct, confidence = await asyncio.to_thread(_run_inference, text)
             source = "onnx-model"
         except Exception as exc:
-            log.warning("Inference error (%s) — falling back to heuristic", exc)
+            log.warning("Inference error (%s) — heuristic fallback", exc)
             ai_pct, human_pct, confidence = _heuristic_fallback(text)
             source = "heuristic-fallback"
     else:
         ai_pct, human_pct, confidence = _heuristic_fallback(text)
         source = "heuristic"
 
-    latency_ms = round((time.time() - t0) * 1000)
-
     return {
-        "models": [
-            {
-                "modelId":       MODEL_ID,
-                "modelName":     MODEL_NAME,
-                "weight":        MODEL_WEIGHT,
-                "ai_percent":    ai_pct,
-                "human_percent": human_pct,
-                "confidence":    confidence,
-                "score":         human_pct,
-                "latencyMs":     latency_ms,
-                "source":        source,
-            }
-        ]
+        "models": [{
+            "modelId":       MODEL_ID,
+            "modelName":     MODEL_NAME,
+            "weight":        MODEL_WEIGHT,
+            "ai_percent":    ai_pct,
+            "human_percent": human_pct,
+            "confidence":    confidence,
+            "score":         human_pct,
+            "latencyMs":     round((time.time() - t0) * 1000),
+            "source":        source,
+        }]
     }
 
 
 # ══════════════════════════════════════════════════════════
-#  FastAPI wrapper  —  text-service
-#  Exposes:  GET /health   POST /detect
+#  FastAPI  —  GET /health   POST /detect
 # ══════════════════════════════════════════════════════════
 
 import os
 from contextlib import asynccontextmanager
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    log.info(
-        "text-service ready  model=%s  pipeline=%s  runtime=ONNX",
-        MODEL_ID,
-        "loaded" if _pipeline else "heuristic-only",
-    )
+    log.info("text-service ready  model=%s  runtime=%s",
+             MODEL_ID, "onnx" if _pipeline else "heuristic-only")
     yield
 
 
 app = FastAPI(title="Text Detection Service", version="1.0.0", lifespan=lifespan)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app.add_middleware(CORSMiddleware,
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"])
 
 
 class TextRequest(BaseModel):
@@ -347,23 +358,21 @@ async def health():
 @app.post("/detect")
 async def detect(req: TextRequest):
     result = await analyze_text(req.content)
-    model  = result["models"][0]
+    m = result["models"][0]
     return {
-        "modelId":       model["modelId"],
-        "modelName":     model["modelName"],
-        "ai_percent":    model["ai_percent"],
-        "human_percent": model["human_percent"],
-        "confidence":    model["confidence"],
-        "score":         model["score"],
-        "latencyMs":     model["latencyMs"],
-        "source":        model["source"],
+        "modelId":       m["modelId"],
+        "modelName":     m["modelName"],
+        "ai_percent":    m["ai_percent"],
+        "human_percent": m["human_percent"],
+        "confidence":    m["confidence"],
+        "score":         m["score"],
+        "latencyMs":     m["latencyMs"],
+        "source":        m["source"],
     }
 
 
 if __name__ == "__main__":
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=int(os.getenv("PORT", 8001)),
-        reload=False,
-    )
+    uvicorn.run("main:app",
+                host="0.0.0.0",
+                port=int(os.getenv("PORT", 8001)),
+                reload=False)
