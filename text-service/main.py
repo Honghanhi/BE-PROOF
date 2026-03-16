@@ -1,44 +1,20 @@
 """
 AI Text Detection Service
 ══════════════════════════════════════════════════════════════
-Primary model : Hello-SimpleAI/chatgpt-detector-roberta  (HuggingFace)
+Primary model : Hello-SimpleAI/chatgpt-detector-roberta  (ONNX Runtime)
 Fallback      : statistical heuristic (zero dependencies)
+
+Thay đổi so với bản gốc
+────────────────────────
+- Dùng optimum[onnxruntime] thay cho torch+transformers thuần
+- RAM giảm từ ~500MB xuống ~200–280MB → chạy được trên Render free tier
+- Tự động export sang ONNX lần đầu chạy (export=True)
+- Mọi logic chunking, label parsing, heuristic fallback giữ nguyên
 
 Label mapping
 ─────────────
   LABEL_0  →  FAKE  →  AI-generated   (low trust score)
   LABEL_1  →  REAL  →  Human-written  (high trust score)
-
-The pipeline returns raw logits → softmax → probabilities.
-We read the REAL (human) probability as the trust score and
-AI probability as 1 − trust.
-
-Chunking
-────────
-RoBERTa has a 512-token hard limit.  Long texts are split into
-overlapping 480-token windows (32-token overlap) and results are
-averaged with a length-weighted mean so every part of the text
-contributes proportionally.
-
-Model cache
-───────────
-The pipeline is loaded once at module import and held in
-_PIPELINE.  Concurrent requests share the same loaded model;
-asyncio.to_thread() keeps the blocking inference off the event
-loop so the server stays responsive.
-
-Exported surface
-────────────────
-  analyze_text(text)  →  { models: [ModelResult] }
-
-ModelResult:
-  modelId      str
-  modelName    str
-  ai_percent   float   0–100
-  human_percent float  0–100
-  confidence   float   0–1
-  score        float   0–100   (= human_percent, trust-score convention)
-  latencyMs    int
 """
 
 from __future__ import annotations
@@ -53,37 +29,54 @@ log = logging.getLogger("aiproof.ai_text")
 
 # ── Model config ──────────────────────────────────────────────────────────────
 
-MODEL_ID   = "Hello-SimpleAI/chatgpt-detector-roberta"
-MODEL_NAME = "ChatGPT Detector RoBERTa (Hello-SimpleAI)"
-MODEL_WEIGHT = 0.35          # consensus weight (higher = more trusted)
+MODEL_ID      = "Hello-SimpleAI/chatgpt-detector-roberta"
+MODEL_NAME    = "ChatGPT Detector RoBERTa (Hello-SimpleAI)"
+MODEL_WEIGHT  = 0.35
 
-MAX_TOKENS   = 512
-WINDOW_TOKENS = 480          # tokens per chunk (< MAX_TOKENS)
-OVERLAP_TOKENS = 32          # overlap between consecutive chunks
+MAX_TOKENS    = 512
+WINDOW_TOKENS = 480
+OVERLAP_TOKENS = 32
 
 # ── Pipeline singleton ────────────────────────────────────────────────────────
 
-_pipeline = None             # transformers TextClassificationPipeline
-_pipeline_error: str | None = None   # set if load failed
+_pipeline = None
+_pipeline_error: str | None = None
+
 
 def _load_pipeline():
     """
-    Load the HuggingFace pipeline once.  Called at import time in a
-    try/except so a missing model or missing torch does not crash the server.
+    Load model qua ONNX Runtime (optimum).
+    - export=True  : tự convert HuggingFace → ONNX lần đầu chạy
+    - Không cần torch, không cần GPU
+    - RAM ~200–280MB thay vì ~500MB
     """
     global _pipeline, _pipeline_error
     try:
-        from transformers import pipeline as hf_pipeline
-        log.info("Loading %s …", MODEL_ID)
+        from optimum.onnxruntime import ORTModelForSequenceClassification
+        from transformers import AutoTokenizer, pipeline as hf_pipeline
+
+        log.info("Loading %s via ONNX Runtime…", MODEL_ID)
         t0 = time.time()
+
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+
+        model = ORTModelForSequenceClassification.from_pretrained(
+            MODEL_ID,
+            export=True,          # convert sang ONNX nếu chưa có file .onnx
+            provider="CPUExecutionProvider",  # bắt buộc dùng CPU trên Render
+        )
+
         _pipeline = hf_pipeline(
             "text-classification",
-            model=MODEL_ID,
-            top_k=None,            # return both LABEL_0 and LABEL_1
+            model=model,
+            tokenizer=tokenizer,
+            top_k=None,
             truncation=True,
             max_length=MAX_TOKENS,
         )
-        log.info("%s loaded in %.1fs", MODEL_ID, time.time() - t0)
+
+        log.info("%s loaded via ONNX in %.1fs", MODEL_ID, time.time() - t0)
+
     except Exception as exc:
         _pipeline_error = str(exc)
         log.warning(
@@ -100,14 +93,9 @@ _load_pipeline()
 def _parse_labels(raw: list[dict]) -> tuple[float, float]:
     """
     Map raw pipeline output → (ai_pct, human_pct).
-
-    Handles all known label formats:
-      LABEL_0 / LABEL_1
-      Fake / Real
-      AI / Human
-      generated / original
+    Xử lý tất cả label format: LABEL_0/1, Fake/Real, AI/Human, generated/original
     """
-    mapping: dict[str, str] = {}
+    mapping: dict[str, float] = {}
     for item in raw:
         lbl = item["label"].upper()
         if lbl in ("LABEL_0", "FAKE", "AI", "GENERATED", "MACHINE"):
@@ -115,13 +103,11 @@ def _parse_labels(raw: list[dict]) -> tuple[float, float]:
         elif lbl in ("LABEL_1", "REAL", "HUMAN", "ORIGINAL"):
             mapping["human"] = item["score"]
 
-    # If only one label came back, derive the other
     if "ai" in mapping and "human" not in mapping:
         mapping["human"] = 1.0 - mapping["ai"]
     elif "human" in mapping and "ai" not in mapping:
         mapping["ai"] = 1.0 - mapping["human"]
     elif not mapping:
-        # Totally unknown label — treat as uncertain
         mapping = {"ai": 0.5, "human": 0.5}
 
     ai_pct    = round(mapping["ai"]    * 100, 2)
@@ -132,10 +118,7 @@ def _parse_labels(raw: list[dict]) -> tuple[float, float]:
 # ── Chunked inference ─────────────────────────────────────────────────────────
 
 def _chunk_text(text: str, tokenizer) -> list[str]:
-    """
-    Split text into overlapping token windows.
-    Returns a list of decoded strings ready for the pipeline.
-    """
+    """Chia text thành các cửa sổ token chồng lấp để xử lý văn bản dài."""
     ids    = tokenizer.encode(text, add_special_tokens=False)
     stride = WINDOW_TOKENS - OVERLAP_TOKENS
     chunks = []
@@ -145,7 +128,6 @@ def _chunk_text(text: str, tokenizer) -> list[str]:
         chunks.append(tokenizer.decode(window, skip_special_tokens=True))
         start += stride
         if start + WINDOW_TOKENS >= len(ids):
-            # Add the final tail and stop
             tail = ids[start:]
             if tail:
                 chunks.append(tokenizer.decode(tail, skip_special_tokens=True))
@@ -155,36 +137,34 @@ def _chunk_text(text: str, tokenizer) -> list[str]:
 
 def _run_inference(text: str) -> tuple[float, float, float]:
     """
-    Blocking inference — run via asyncio.to_thread().
-    Returns (ai_pct, human_pct, confidence).
+    Blocking inference — được gọi qua asyncio.to_thread().
+    Trả về (ai_pct, human_pct, confidence).
     """
-    pipe = _pipeline
+    pipe      = _pipeline
     tokenizer = pipe.tokenizer
 
-    # Rough token estimate to decide whether chunking is needed
     approx_tokens = len(text.split()) * 1.3
+
     if approx_tokens <= WINDOW_TOKENS:
-        raw    = pipe(text, truncation=True, max_length=MAX_TOKENS)[0]
+        raw        = pipe(text, truncation=True, max_length=MAX_TOKENS)[0]
         chunks_raw = [raw if isinstance(raw, list) else [raw]]
+        chunk_texts = [text]
     else:
-        chunks     = _chunk_text(text, tokenizer)
-        chunks_raw = [
+        chunk_texts = _chunk_text(text, tokenizer)
+        chunks_raw  = [
             (r if isinstance(r, list) else [r])
-            for r in pipe(chunks, truncation=True, max_length=MAX_TOKENS)
+            for r in pipe(chunk_texts, truncation=True, max_length=MAX_TOKENS)
         ]
 
-    # Weighted average — longer chunks carry more weight
     total_weight = 0.0
     ai_sum       = 0.0
     human_sum    = 0.0
     conf_sum     = 0.0
 
-    chunk_texts = _chunk_text(text, tokenizer) if approx_tokens > WINDOW_TOKENS else [text]
-
     for i, label_list in enumerate(chunks_raw):
-        w         = len(chunk_texts[i].split()) if i < len(chunk_texts) else 1
+        w          = len(chunk_texts[i].split()) if i < len(chunk_texts) else 1
         ai_p, hu_p = _parse_labels(label_list)
-        conf      = max(ai_p, hu_p) / 100.0
+        conf       = max(ai_p, hu_p) / 100.0
         ai_sum    += ai_p * w
         human_sum += hu_p * w
         conf_sum  += conf * w
@@ -193,9 +173,9 @@ def _run_inference(text: str) -> tuple[float, float, float]:
     if total_weight == 0:
         return 50.0, 50.0, 0.5
 
-    ai_pct    = round(ai_sum    / total_weight, 2)
-    human_pct = round(human_sum / total_weight, 2)
-    confidence = round(conf_sum / total_weight, 4)
+    ai_pct     = round(ai_sum    / total_weight, 2)
+    human_pct  = round(human_sum / total_weight, 2)
+    confidence = round(conf_sum  / total_weight, 4)
 
     return ai_pct, human_pct, confidence
 
@@ -204,23 +184,18 @@ def _run_inference(text: str) -> tuple[float, float, float]:
 
 def _heuristic_fallback(text: str) -> tuple[float, float, float]:
     """
-    Pure-Python statistical fallback when the transformer is unavailable.
-    Uses type-token ratio, sentence-length variance, and AI-marker density.
-
-    Returns (ai_pct, human_pct, confidence).
-    Confidence is always low (≤ 0.55) to signal fallback mode.
+    Fallback thuần Python khi ONNX pipeline không load được.
+    Confidence luôn thấp (≤ 0.55) để báo hiệu chế độ fallback.
     """
     import re as _re
 
-    words   = text.split()
+    words = text.split()
     if not words:
         return 50.0, 50.0, 0.0
 
-    # Type-token ratio (low TTR → more repetitive → more AI-like)
     unique = len(set(w.lower().strip(".,!?;:\"'") for w in words))
     ttr    = unique / len(words)
 
-    # Sentence length variance (AI tends to produce uniform sentence lengths)
     sentences = [s.strip() for s in _re.split(r"[.!?]+", text) if s.strip()]
     if len(sentences) >= 2:
         lengths  = [len(s.split()) for s in sentences]
@@ -228,31 +203,27 @@ def _heuristic_fallback(text: str) -> tuple[float, float, float]:
         variance = sum((l - mean_l) ** 2 for l in lengths) / len(lengths)
         std_dev  = math.sqrt(variance)
     else:
-        std_dev = 5.0   # neutral default
+        std_dev = 5.0
 
-    # AI marker words
     AI_MARKERS = [
         "furthermore", "moreover", "additionally", "in conclusion",
         "it is worth noting", "it is important to note", "in summary",
         "as mentioned earlier", "delve", "underscore", "pivotal",
         "it should be noted", "with that said", "that being said",
     ]
-    text_lower = text.lower()
+    text_lower  = text.lower()
     marker_hits = sum(1 for m in AI_MARKERS if m in text_lower)
 
-    # Combine signals → ai_pct
-    # Low TTR, low variance, many markers → higher AI probability
-    ttr_signal      = max(0, (0.72 - ttr) * 60)          # 0–43
-    var_signal      = max(0, (8.0 - std_dev) * 2.5)      # 0–20
-    marker_signal   = min(30, marker_hits * 7)             # 0–30
+    ttr_signal    = max(0, (0.72 - ttr) * 60)
+    var_signal    = max(0, (8.0 - std_dev) * 2.5)
+    marker_signal = min(30, marker_hits * 7)
 
-    ai_raw   = ttr_signal + var_signal + marker_signal     # 0–93
-    ai_pct   = round(min(92, max(8, ai_raw)), 2)
+    ai_raw    = ttr_signal + var_signal + marker_signal
+    ai_pct    = round(min(92, max(8, ai_raw)), 2)
     human_pct = round(100 - ai_pct, 2)
 
-    # Scale word-count → confidence (more text → more certain)
     wc_conf    = min(1.0, len(words) / 250)
-    confidence = round(0.35 + wc_conf * 0.20, 4)          # 0.35–0.55
+    confidence = round(0.35 + wc_conf * 0.20, 4)
 
     return ai_pct, human_pct, confidence
 
@@ -261,19 +232,19 @@ def _heuristic_fallback(text: str) -> tuple[float, float, float]:
 
 async def analyze_text(text: str) -> dict[str, Any]:
     """
-    Analyze text for AI-generation signals.
+    Phân tích text để phát hiện AI-generated content.
 
-    Returns:
+    Trả về:
         {
           "models": [
             {
-              "modelId":      "roberta-base-openai-detector",
-              "modelName":    "ChatGPT Detector RoBERTa (Hello-SimpleAI)",
-              "ai_percent":   float,   # 0–100
-              "human_percent":float,   # 0–100
-              "confidence":   float,   # 0–1
-              "score":        float,   # = human_percent (trust-score convention)
-              "latencyMs":    int,
+              "modelId":       str,
+              "modelName":     str,
+              "ai_percent":    float,   # 0–100
+              "human_percent": float,   # 0–100
+              "confidence":    float,   # 0–1
+              "score":         float,   # = human_percent
+              "latencyMs":     int,
             }
           ]
         }
@@ -281,18 +252,16 @@ async def analyze_text(text: str) -> dict[str, Any]:
     t0 = time.time()
 
     if _pipeline is not None:
-        # Real inference — offload blocking call to thread pool
         try:
             ai_pct, human_pct, confidence = await asyncio.to_thread(
                 _run_inference, text
             )
-            source = "model"
+            source = "onnx-model"
         except Exception as exc:
             log.warning("Inference error (%s) — falling back to heuristic", exc)
             ai_pct, human_pct, confidence = _heuristic_fallback(text)
             source = "heuristic-fallback"
     else:
-        # Model never loaded — use heuristic
         ai_pct, human_pct, confidence = _heuristic_fallback(text)
         source = "heuristic"
 
@@ -307,12 +276,14 @@ async def analyze_text(text: str) -> dict[str, Any]:
                 "ai_percent":    ai_pct,
                 "human_percent": human_pct,
                 "confidence":    confidence,
-                "score":         human_pct,   # trust-score convention: 100 = human
+                "score":         human_pct,
                 "latencyMs":     latency_ms,
                 "source":        source,
             }
         ]
     }
+
+
 # ══════════════════════════════════════════════════════════
 #  FastAPI wrapper  —  text-service
 #  Exposes:  GET /health   POST /detect
@@ -328,15 +299,22 @@ from pydantic import BaseModel, field_validator
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    log.info("text-service ready  model=%s  pipeline=%s",
-             MODEL_ID, "loaded" if _pipeline else "heuristic-only")
+    log.info(
+        "text-service ready  model=%s  pipeline=%s  runtime=ONNX",
+        MODEL_ID,
+        "loaded" if _pipeline else "heuristic-only",
+    )
     yield
 
 
 app = FastAPI(title="Text Detection Service", version="1.0.0", lifespan=lifespan)
-app.add_middleware(CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True,
-    allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 class TextRequest(BaseModel):
@@ -356,6 +334,7 @@ async def health():
         "status":   "ok",
         "service":  "text-detection",
         "model":    MODEL_ID,
+        "runtime":  "onnx" if _pipeline else "heuristic",
         "pipeline": _pipeline is not None,
     }
 
@@ -377,7 +356,9 @@ async def detect(req: TextRequest):
 
 
 if __name__ == "__main__":
-    uvicorn.run("main:app",
-                host="0.0.0.0",
-                port=int(os.getenv("PORT", 8001)),
-                reload=False)
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", 8001)),
+        reload=False,
+    )
