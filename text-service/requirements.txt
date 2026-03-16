@@ -3,12 +3,11 @@ fastapi>=0.110.0
 uvicorn[standard]>=0.29.0
 pydantic>=2.0.0
 
-# ── ONNX Runtime (KHÔNG kéo torch) ───────────────────────
+# ── ONNX Runtime thuần CPU — KHÔNG kéo torch ─────────────
 onnxruntime>=1.17.0
-optimum>=1.19.0               # KHÔNG dùng optimum[onnxruntime] → tránh kéo torch
-
-# ── HuggingFace ───────────────────────────────────────────
-transformers>=4.40.0
-huggingface-hub>=0.22.0
-sentencepiece>=0.1.99
 tokenizers>=0.15.0
+huggingface-hub>=0.22.0
+numpy>=1.24.0
+
+# ── KHÔNG có: torch, transformers, optimum ───────────────
+# (3 package trên là nguyên nhân kéo 888MB torch)
