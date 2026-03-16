@@ -3,14 +3,12 @@ fastapi>=0.110.0
 uvicorn[standard]>=0.29.0
 pydantic>=2.0.0
 
-# ── ONNX Runtime (thay thế torch + transformers thuần) ────
-# RAM ~200–280MB thay vì ~500MB, chạy tốt trên CPU free tier
-optimum[onnxruntime]>=1.19.0
-onnxruntime>=1.17.0          # CPU-only, không cần GPU
+# ── ONNX Runtime (KHÔNG kéo torch) ───────────────────────
+onnxruntime>=1.17.0
+optimum>=1.19.0               # KHÔNG dùng optimum[onnxruntime] → tránh kéo torch
 
-# ── HuggingFace (vẫn cần để load tokenizer & pipeline) ───
+# ── HuggingFace ───────────────────────────────────────────
 transformers>=4.40.0
 huggingface-hub>=0.22.0
-
-# ── Không cần torch nữa ───────────────────────────────────
-# torch đã bị loại bỏ → tiết kiệm ~400MB RAM và ~1GB disk
+sentencepiece>=0.1.99
+tokenizers>=0.15.0
