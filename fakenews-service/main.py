@@ -1,17 +1,23 @@
 """
 Fake News Detection Service
 ══════════════════════════════════════════════════════════════
-Runtime       : ONNX Runtime CPU  (KHÔNG có torch / transformers)
-Model         : cross-encoder/nli-MiniLM2-L6-H768  (ONNX export)
-Fallback      : sensationalism + credibility heuristic
-RAM           : ~238 MB  (an toàn trên Render Free 512 MB)
+Runtime       : Heuristic thuần — KHÔNG có torch, transformers,
+                onnxruntime, hay bất kỳ ML dependency nào
+RAM           : ~35 MB  (chỉ FastAPI + uvicorn + httpx)
+Startup       : < 1s
 
-Thay đổi so với bản torch
-──────────────────────────
-- Bỏ hoàn toàn torch + transformers
-- Dùng onnxruntime + tokenizers (Rust) để chạy cùng model weights
-- Inference thủ công: tokenize → ONNX session → softmax → score
-- Độ chính xác giữ nguyên ~99% (cùng weights, khác engine)
+Phương pháp
+───────────
+5 tầng phân tích độc lập, kết hợp có trọng số:
+
+  1. Sensationalism score   — clickbait phrases, ALLCAPS, dấu !!!
+  2. Credibility score      — citation markers, nguồn uy tín
+  3. Linguistic score       — hedge words, absolute language, weasel words
+  4. Structure score        — độ dài bài, tỉ lệ câu hỏi, đoạn văn
+  5. Source score           — domain trong URL (nếu có)
+
+Mỗi tầng trả về 0–100 (100 = chắc chắn fake).
+Weighted average → fake_percent cuối cùng.
 """
 
 from __future__ import annotations
@@ -21,209 +27,256 @@ import logging
 import re
 import time
 from typing import Any
-
-import numpy as np
+from urllib.parse import urlparse
 
 log = logging.getLogger("aiproof.fake_news")
 
-# ── Model config ──────────────────────────────────────────────────────────────
+MODEL_ID     = "heuristic-advanced-v2"
+MODEL_NAME   = "Advanced Heuristic Analyzer"
+MODEL_WEIGHT = 1.0
+MAX_CHARS    = 8_000
 
-MODEL_ID     = "cross-encoder/nli-MiniLM2-L6-H768"
-MODEL_NAME   = "NLI-MiniLM2 L6 (Cross-Encoder)"
-MODEL_WEIGHT = 0.25
-MAX_CHARS    = 4_000
+# ── Layer 1: Sensationalism ───────────────────────────────────────────────────
 
-# ONNX repo trên HuggingFace — đã có sẵn file .onnx, không cần convert
-_ONNX_REPO = "cross-encoder/nli-MiniLM2-L6-H768"
-
-# NLI label order từ model config:
-# 0 = contradiction, 1 = entailment, 2 = neutral
-_LABEL_CONTRADICTION = 0
-_LABEL_ENTAILMENT    = 1
-
-# ── Zero-shot hypothesis pairs ────────────────────────────────────────────────
-
-_HYPOTHESES: list[tuple[str, str]] = [
-    (
-        "This article contains factual, verified information.",
-        "This article contains misinformation or false claims.",
-    ),
-    (
-        "This article uses balanced, neutral, objective language.",
-        "This article uses sensationalist, exaggerated, or misleading language.",
-    ),
-    (
-        "This article is supported by credible sources and evidence.",
-        "This article makes unsubstantiated or unverifiable claims.",
-    ),
+_SENSATIONAL_HIGH = [
+    "you won't believe", "they don't want you to know", "hidden truth",
+    "mainstream media lies", "wake up sheeple", "plandemic", "false flag",
+    "deep state", "big pharma conspiracy", "doctors don't want",
+    "miracle cure", "secret remedy", "banned by", "what they're hiding",
+    "the truth about", "exposed!", "they lied", "cover-up revealed",
 ]
 
-# ── Keyword lists ─────────────────────────────────────────────────────────────
-
-_SENSATIONAL_PHRASES = [
-    "breaking", "shocking", "bombshell", "explosive", "you won't believe",
-    "they don't want you to know", "hidden truth", "mainstream media lies",
-    "big pharma", "deep state", "exposed", "wake up", "sheeple",
-    "plandemic", "false flag", "hoax", "cover-up", "banned",
-    "doctors don't want", "miracle cure", "secret remedy",
+_SENSATIONAL_MED = [
+    "breaking", "shocking", "bombshell", "explosive", "urgent",
+    "exposed", "hoax", "cover-up", "banned", "censored",
+    "wake up", "sheeple", "mainstream media", "crisis actors",
+    "they don't want", "hidden agenda", "new world order",
+    "mind control", "chemtrails", "microchip",
 ]
 
-_CREDIBILITY_PHRASES = [
-    "according to", "researchers found", "study published",
-    "peer-reviewed", "official statement", "confirmed by",
+_CLICKBAIT_PATTERNS = [
+    r"\b\d+\s+reasons?\b",
+    r"\bthis is why\b",
+    r"\byou need to (know|see|read)\b",
+    r"\bwhat (they|he|she|no one) (won't|didn't|doesn't)\b",
+    r"\bthe (real|shocking|hidden|dark) truth\b",
+    r"\bthis will (shock|surprise|blow your mind)\b",
+]
+
+# ── Layer 2: Credibility ──────────────────────────────────────────────────────
+
+_CREDIBILITY_STRONG = [
+    "peer-reviewed", "published in", "according to the study",
+    "clinical trial", "randomized controlled", "meta-analysis",
+    "systematic review", "official statement", "press release",
+    "confirmed by", "verified by", "fact-checked",
+]
+
+_CREDIBILITY_MED = [
+    "according to", "researchers found", "study shows",
     "data shows", "report says", "spokesperson said",
+    "experts say", "scientists found", "survey found",
+    "statistics show", "evidence suggests", "analysis found",
 ]
 
-# ── ONNX session + tokenizer globals ─────────────────────────────────────────
+_CREDIBLE_DOMAINS = [
+    "reuters.com", "apnews.com", "bbc.com", "bbc.co.uk",
+    "theguardian.com", "nytimes.com", "washingtonpost.com",
+    "nature.com", "science.org", "who.int", "cdc.gov",
+    "nih.gov", "gov.uk", "europa.eu", "un.org",
+]
 
-_SESSION:    Any = None   # onnxruntime.InferenceSession
-_TOKENIZER:  Any = None   # tokenizers.Tokenizer
-_load_error: str | None = None
+_SUSPICIOUS_DOMAINS = [
+    "infowars", "naturalnews", "beforeitsnews", "zerohedge",
+    "breitbart", "thegatewaypundit", "worldnewsdailyreport",
+    "empirenews", "realnewsrightnow", "abcnews.com.co",
+]
+
+# ── Layer 3: Linguistic ───────────────────────────────────────────────────────
+
+_ABSOLUTE_WORDS = [
+    "always", "never", "everyone", "nobody", "all", "none",
+    "every single", "without exception", "100%", "definitely",
+    "certainly", "undoubtedly", "absolutely", "proven fact",
+    "irrefutable", "undeniable", "unquestionable",
+]
+
+_HEDGE_WORDS = [
+    "allegedly", "reportedly", "according to", "it appears",
+    "it seems", "may", "might", "could", "possibly", "perhaps",
+    "some sources", "unconfirmed", "unclear",
+]
+
+_WEASEL_WORDS = [
+    "many people say", "some people think", "experts believe",
+    "sources say", "it is said", "rumor has it",
+    "word is", "people are saying", "they say",
+]
+
+# ── Scoring functions ─────────────────────────────────────────────────────────
+
+def _score_sensationalism(text: str, lower: str) -> tuple[float, list[dict]]:
+    signals = []
+    score   = 0.0
+
+    for phrase in _SENSATIONAL_HIGH:
+        if phrase in lower:
+            score += 18
+            signals.append({"type": "sensationalism", "phrase": phrase, "severity": "high"})
+
+    med_hits = sum(1 for p in _SENSATIONAL_MED if p in lower)
+    score += min(30, med_hits * 7)
+    for p in _SENSATIONAL_MED:
+        if p in lower:
+            signals.append({"type": "sensationalism", "phrase": p, "severity": "medium"})
+
+    for pattern in _CLICKBAIT_PATTERNS:
+        if re.search(pattern, lower):
+            score += 8
+            signals.append({"type": "clickbait", "phrase": pattern, "severity": "medium"})
+
+    allcaps = [w for w in re.findall(r'\b[A-Z]{4,}\b', text)
+               if w not in ("NASA", "NATO", "IAEA", "UEFA", "FIFA", "HTTP", "HTML")]
+    if len(allcaps) > 3:
+        score += min(15, len(allcaps) * 2)
+        signals.append({"type": "allcaps", "phrase": f"{len(allcaps)} ALL-CAPS words", "severity": "medium"})
+
+    exclaim = text.count("!")
+    if exclaim > 3:
+        score += min(12, exclaim * 2)
+        signals.append({"type": "punctuation", "phrase": f"{exclaim} exclamation marks", "severity": "low"})
+
+    return min(100.0, score), signals
 
 
-def _load_model() -> None:
-    global _SESSION, _TOKENIZER, _load_error
+def _score_credibility(lower: str) -> tuple[float, list[dict]]:
+    signals = []
+    score   = 50.0
+
+    for phrase in _CREDIBILITY_STRONG:
+        if phrase in lower:
+            score -= 12
+            signals.append({"type": "credibility_marker", "phrase": phrase, "severity": "positive"})
+
+    cred_hits = sum(1 for p in _CREDIBILITY_MED if p in lower)
+    score -= min(20, cred_hits * 5)
+    for p in _CREDIBILITY_MED:
+        if p in lower:
+            signals.append({"type": "credibility_marker", "phrase": p, "severity": "positive"})
+
+    return max(0.0, min(100.0, score)), signals
+
+
+def _score_linguistic(text: str, lower: str) -> tuple[float, list[dict]]:
+    signals = []
+    score   = 30.0
+
+    abs_hits = sum(1 for w in _ABSOLUTE_WORDS if w in lower)
+    score += min(25, abs_hits * 6)
+    if abs_hits:
+        signals.append({"type": "absolute-language", "phrase": f"{abs_hits} absolute claims", "severity": "medium"})
+
+    weasel_hits = sum(1 for w in _WEASEL_WORDS if w in lower)
+    score += min(20, weasel_hits * 7)
+    if weasel_hits:
+        signals.append({"type": "weasel-words", "phrase": f"{weasel_hits} unattributed claims", "severity": "medium"})
+
+    hedge_hits = sum(1 for w in _HEDGE_WORDS if w in lower)
+    score -= min(15, hedge_hits * 3)
+
+    emotional = len(re.findall(
+        r'\b(outrage|disgusting|evil|corrupt|traitor|tyranny|freedom|liberty|'
+        r'communist|fascist|globalist|elite|puppet|slave|regime|coup)\b', lower
+    ))
+    if emotional > 2:
+        score += min(15, emotional * 3)
+        signals.append({"type": "emotional-language", "phrase": f"{emotional} emotionally charged words", "severity": "medium"})
+
+    return max(0.0, min(100.0, score)), signals
+
+
+def _score_structure(text: str) -> tuple[float, list[dict]]:
+    signals    = []
+    score      = 25.0
+    words      = text.split()
+    word_count = len(words)
+    sentences  = [s.strip() for s in re.split(r'[.!?]+', text) if len(s.strip()) > 10]
+    n_sent     = max(1, len(sentences))
+
+    if word_count < 100:
+        score += 20
+        signals.append({"type": "structure", "phrase": f"Very short article ({word_count} words)", "severity": "medium"})
+    elif word_count > 600:
+        score -= 10
+
+    avg_sent_len = word_count / n_sent
+    if avg_sent_len < 8:
+        score += 10
+        signals.append({"type": "structure", "phrase": "Unusually short sentences", "severity": "low"})
+
+    q_ratio = text.count("?") / n_sent
+    if q_ratio > 0.3:
+        score += 10
+        signals.append({"type": "structure", "phrase": "High ratio of rhetorical questions", "severity": "low"})
+
+    unique_ratio = len(set(w.lower() for w in words)) / max(1, word_count)
+    if unique_ratio < 0.4:
+        score += 8
+        signals.append({"type": "structure", "phrase": "Low vocabulary diversity", "severity": "low"})
+
+    return max(0.0, min(100.0, score)), signals
+
+
+def _score_source(url: str | None) -> tuple[float, list[dict]]:
+    if not url:
+        return 50.0, []
+
+    signals = []
     try:
-        import onnxruntime as ort
-        from tokenizers import Tokenizer
-        from huggingface_hub import hf_hub_download
+        domain = urlparse(url).netloc.lower().replace("www.", "")
+    except Exception:
+        return 50.0, []
 
-        log.info("Downloading NLI-MiniLM2 ONNX from %s …", _ONNX_REPO)
-        t0 = time.time()
+    for d in _CREDIBLE_DOMAINS:
+        if d in domain:
+            signals.append({"type": "source", "phrase": f"Credible domain: {domain}", "severity": "positive"})
+            return 10.0, signals
 
-        # 1. Tokenizer
-        tok_path   = hf_hub_download(_ONNX_REPO, "tokenizer.json")
-        _TOKENIZER = Tokenizer.from_file(tok_path)
-        _TOKENIZER.enable_truncation(max_length=512)
-        _TOKENIZER.enable_padding(length=512)
+    for d in _SUSPICIOUS_DOMAINS:
+        if d in domain:
+            signals.append({"type": "source", "phrase": f"Known unreliable domain: {domain}", "severity": "high"})
+            return 85.0, signals
 
-        # 2. ONNX session
-        model_path = hf_hub_download(_ONNX_REPO, "onnx/model.onnx")
-        opts = ort.SessionOptions()
-        opts.intra_op_num_threads = 2
-        _SESSION = ort.InferenceSession(
-            model_path,
-            sess_options=opts,
-            providers=["CPUExecutionProvider"],
-        )
-        log.info("NLI-MiniLM2 ONNX loaded in %.1fs", time.time() - t0)
-
-    except Exception as exc:
-        _load_error = str(exc)
-        log.warning("Could not load NLI model (%s) — heuristic fallback active", exc)
+    return 50.0, signals
 
 
-_load_model()
+# ── Main scorer ───────────────────────────────────────────────────────────────
 
-
-# ── Softmax helper ────────────────────────────────────────────────────────────
-
-def _softmax(x: np.ndarray) -> np.ndarray:
-    e = np.exp(x - x.max(axis=-1, keepdims=True))
-    return e / e.sum(axis=-1, keepdims=True)
-
-
-# ── ONNX NLI inference ────────────────────────────────────────────────────────
-
-def _nli_score(premise: str, hypothesis: str) -> tuple[float, float]:
-    """
-    Run one NLI inference.
-    Returns (entailment_prob, contradiction_prob).
-    """
-    enc = _TOKENIZER.encode(premise, hypothesis)
-
-    input_ids      = np.array([enc.ids],             dtype=np.int64)
-    attention_mask = np.array([enc.attention_mask],   dtype=np.int64)
-    token_type_ids = np.array([enc.type_ids],         dtype=np.int64)
-
-    input_names = [i.name for i in _SESSION.get_inputs()]
-    feeds: dict[str, np.ndarray] = {
-        "input_ids":      input_ids,
-        "attention_mask": attention_mask,
-    }
-    if "token_type_ids" in input_names:
-        feeds["token_type_ids"] = token_type_ids
-
-    logits = _SESSION.run(None, feeds)[0]          # (1, 3)
-    probs  = _softmax(logits)[0]                   # (3,)
-
-    return float(probs[_LABEL_ENTAILMENT]), float(probs[_LABEL_CONTRADICTION])
-
-
-# ── Zero-shot classification ──────────────────────────────────────────────────
-
-def _run_zero_shot(text: str) -> tuple[float, float, float, list[dict]]:
-    """
-    Blocking — run via asyncio.to_thread().
-    Returns (fake_pct, real_pct, confidence, signals).
-    """
-    snippet     = text[:MAX_CHARS]
-    fake_probs  = []
-    real_probs  = []
-
-    for real_hyp, fake_hyp in _HYPOTHESES:
-        # Score premise against FAKE hypothesis
-        fake_ent, fake_con = _nli_score(snippet, fake_hyp)
-        # Score premise against REAL hypothesis
-        real_ent, real_con = _nli_score(snippet, real_hyp)
-
-        # Entailment to fake hyp → evidence of fake
-        # Entailment to real hyp → evidence of real
-        # Normalise pair so they sum to 1
-        total = fake_ent + real_ent + 1e-9
-        fake_probs.append(fake_ent / total)
-        real_probs.append(real_ent / total)
-
-    fake_pct   = round(float(np.mean(fake_probs)) * 100, 2)
-    real_pct   = round(100 - fake_pct, 2)
-    confidence = round(abs(fake_pct / 100 - 0.5) * 2, 4)
-    signals    = _extract_signals(text, fake_pct)
-
-    return fake_pct, real_pct, confidence, signals
-
-
-# ── Heuristic fallback ────────────────────────────────────────────────────────
-
-def _heuristic_fallback(text: str) -> tuple[float, float, float, list[dict]]:
+def _run_heuristic(text: str, url: str | None = None) -> tuple[float, float, float, list[dict]]:
     lower = text.lower()
 
-    sensational_hits = sum(1 for p in _SENSATIONAL_PHRASES if p in lower)
-    credible_hits    = sum(1 for p in _CREDIBILITY_PHRASES  if p in lower)
+    s1, sig1 = _score_sensationalism(text, lower)
+    s2, sig2 = _score_credibility(lower)
+    s3, sig3 = _score_linguistic(text, lower)
+    s4, sig4 = _score_structure(text)
+    s5, sig5 = _score_source(url)
 
-    fake_raw = 35 + sensational_hits * 9 - credible_hits * 6
-    fake_pct = round(min(90, max(10, fake_raw)), 2)
-    real_pct = round(100 - fake_pct, 2)
+    fake_pct = (
+        s1 * 0.30 +
+        s2 * 0.25 +
+        s3 * 0.20 +
+        s4 * 0.10 +
+        s5 * 0.15
+    )
+    fake_pct   = round(min(97, max(3, fake_pct)), 2)
+    real_pct   = round(100 - fake_pct, 2)
+    confidence = round(abs(fake_pct / 100 - 0.5) * 2, 4)
 
-    word_count = len(text.split())
-    confidence = round(min(0.50, 0.25 + word_count / 1000 * 0.25), 4)
-    signals    = _extract_signals(text, fake_pct)
+    all_signals = sig1 + sig2 + sig3 + sig4 + sig5
+    severity_order = {"high": 0, "medium": 1, "low": 2, "positive": 3}
+    all_signals.sort(key=lambda s: severity_order.get(s.get("severity", "low"), 2))
 
-    return fake_pct, real_pct, confidence, signals
-
-
-# ── Signal extraction ─────────────────────────────────────────────────────────
-
-def _extract_signals(text: str, fake_pct: float) -> list[dict]:
-    lower   = text.lower()
-    signals = []
-
-    for phrase in _SENSATIONAL_PHRASES:
-        if phrase in lower:
-            signals.append({
-                "type":     "sensationalism",
-                "phrase":   phrase,
-                "severity": "high" if fake_pct > 60 else "medium",
-            })
-
-    for phrase in _CREDIBILITY_PHRASES:
-        if phrase in lower:
-            signals.append({
-                "type":     "credibility_marker",
-                "phrase":   phrase,
-                "severity": "positive",
-            })
-
-    return signals[:12]
+    return fake_pct, real_pct, confidence, all_signals[:12]
 
 
 # ── URL fetcher ───────────────────────────────────────────────────────────────
@@ -238,7 +291,7 @@ async def fetch_url(url: str, timeout: float = 15.0) -> str:
         async with httpx.AsyncClient(
             timeout=timeout,
             follow_redirects=True,
-            headers={"User-Agent": "AI-PROOF/2.1 fake-news-detector"},
+            headers={"User-Agent": "AI-PROOF/2.2 fake-news-detector"},
         ) as client:
             resp = await client.get(url)
             resp.raise_for_status()
@@ -250,51 +303,34 @@ async def fetch_url(url: str, timeout: float = 15.0) -> str:
 
 
 def _clean_html(html: str) -> str:
-    html = re.sub(
-        r"<(script|style)[^>]*>.*?</(script|style)>", " ",
-        html, flags=re.DOTALL | re.IGNORECASE,
-    )
+    html = re.sub(r"<(script|style)[^>]*>.*?</(script|style)>", " ",
+                  html, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r"<[^>]+>", " ", html)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
+    return re.sub(r"\s+", " ", text).strip()
 
 
 # ── Public entry point ────────────────────────────────────────────────────────
 
-async def detect_fake_news(text: str) -> dict[str, Any]:
+async def detect_fake_news(text: str, url: str | None = None) -> dict[str, Any]:
     t0 = time.time()
 
-    if _SESSION is not None and _TOKENIZER is not None:
-        try:
-            fake_pct, real_pct, confidence, signals = await asyncio.to_thread(
-                _run_zero_shot, text
-            )
-            source = "onnx-model"
-        except Exception as exc:
-            log.warning("ONNX inference error (%s) — heuristic fallback", exc)
-            fake_pct, real_pct, confidence, signals = _heuristic_fallback(text)
-            source = "heuristic-fallback"
-    else:
-        fake_pct, real_pct, confidence, signals = _heuristic_fallback(text)
-        source = "heuristic"
-
-    latency_ms = round((time.time() - t0) * 1000)
+    fake_pct, real_pct, confidence, signals = await asyncio.to_thread(
+        _run_heuristic, text, url
+    )
 
     return {
-        "models": [
-            {
-                "modelId":      MODEL_ID,
-                "modelName":    MODEL_NAME,
-                "weight":       MODEL_WEIGHT,
-                "fake_percent": fake_pct,
-                "real_percent": real_pct,
-                "confidence":   confidence,
-                "score":        real_pct,
-                "signals":      signals,
-                "latencyMs":    latency_ms,
-                "source":       source,
-            }
-        ]
+        "models": [{
+            "modelId":      MODEL_ID,
+            "modelName":    MODEL_NAME,
+            "weight":       MODEL_WEIGHT,
+            "fake_percent": fake_pct,
+            "real_percent": real_pct,
+            "confidence":   confidence,
+            "score":        real_pct,
+            "signals":      signals,
+            "latencyMs":    round((time.time() - t0) * 1000),
+            "source":       "heuristic",
+        }]
     }
 
 
@@ -314,26 +350,14 @@ from pydantic import BaseModel, field_validator
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    log.info(
-        "fakenews-service ready  model=%s  runtime=%s",
-        MODEL_ID,
-        "onnx" if _SESSION else "heuristic-only",
-    )
+    log.info("fakenews-service ready  runtime=heuristic-only  ram=~35MB")
     yield
 
 
-app = FastAPI(
-    title="Fake News Detection Service",
-    version="2.0.0",
-    lifespan=lifespan,
-)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app = FastAPI(title="Fake News Detection Service", version="3.0.0", lifespan=lifespan)
+app.add_middleware(CORSMiddleware,
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"])
 
 
 class FakeNewsRequest(BaseModel):
@@ -350,14 +374,8 @@ class FakeNewsRequest(BaseModel):
 
 @app.get("/health")
 async def health():
-    return {
-        "status":   "ok",
-        "service":  "fakenews-detection",
-        "model":    MODEL_ID,
-        "runtime":  "onnx" if _SESSION else "heuristic",
-        "pipeline": _SESSION is not None,
-        "version":  "2.0.0",
-    }
+    return {"status": "ok", "service": "fakenews-detection",
+            "runtime": "heuristic", "pipeline": True, "version": "3.0.0"}
 
 
 @app.post("/detect")
@@ -369,15 +387,14 @@ async def detect(req: FakeNewsRequest):
             raise HTTPException(422, detail=str(exc))
         if not text or len(text.strip()) < 10:
             raise HTTPException(422, detail="Could not extract readable text from URL")
+        url = req.url
     elif req.content and len(req.content.strip()) >= 10:
         text = req.content.strip()
+        url  = None
     else:
-        raise HTTPException(
-            400,
-            detail="Provide 'content' (min 10 chars) or a valid 'url'",
-        )
+        raise HTTPException(400, detail="Provide 'content' (min 10 chars) or a valid 'url'")
 
-    result = await detect_fake_news(text)
+    result = await detect_fake_news(text, url)
     model  = result["models"][0]
 
     return {
@@ -396,9 +413,5 @@ async def detect(req: FakeNewsRequest):
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=int(os.getenv("PORT", 8002)),
-        reload=False,
-    )
+    uvicorn.run("main:app", host="0.0.0.0",
+                port=int(os.getenv("PORT", 8002)), reload=False)
