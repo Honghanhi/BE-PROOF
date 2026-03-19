@@ -60,15 +60,17 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="AI-PROOF Gateway", version="2.0.0", lifespan=lifespan)
 
-_origins = [o.strip() for o in os.getenv("CORS_ORIGINS","*").split(",")]
+_origins_raw = os.getenv("CORS_ORIGINS", "")
+_origins      = [o.strip() for o in _origins_raw.split(",") if o.strip()] or ["*"]
+_credentials  = "*" not in _origins   # credentials require explicit origins
 app.add_middleware(CORSMiddleware,
-    allow_origins=_origins, allow_credentials=True,
+    allow_origins=_origins, allow_credentials=_credentials,
     allow_methods=["GET","POST","OPTIONS"], allow_headers=["*"])
 
 @app.exception_handler(Exception)
 async def _err(request: Request, exc: Exception):
     log.exception("Unhandled error: %s", exc)
-    return JSONResponse(500, content={"detail": str(exc)})
+    return JSONResponse(status_code=500, content={"detail": str(exc)})
 
 # ── Service caller ────────────────────────────────────────────────────────────
 
@@ -86,6 +88,7 @@ async def _call(url: str, body: dict, retries: int = 1) -> dict:
             if attempt == retries:
                 raise HTTPException(503, detail=f"Service unreachable: {url}  ({e})")
             await asyncio.sleep(0.5)
+    raise HTTPException(503, detail=f"Service unreachable: {url}")
 
 async def _health_service(url: str, name: str) -> dict:
     try:
@@ -126,9 +129,10 @@ VERDICTS = [(85,"AUTHENTIC","badge-green","#00ff9d"),
             (0,"AI-GENERATED","badge-red","#ff3d5a")]
 
 def _verdict(score: int) -> dict:
-    for t,l,bc,c in VERDICTS:
-        if score >= t: return {"label":l,"class":bc,"color":c}
-    return {"label":"UNKNOWN","class":"badge-cyan","color":"#00e5ff"}
+    for t, l, bc, c in VERDICTS:
+        if score >= t:
+            return {"label": l, "class": bc, "color": c}
+    return {"label": "UNKNOWN", "class": "badge-cyan", "color": "#00e5ff"}
 
 def _ms(t0): return round((time.time()-t0)*1000)
 
